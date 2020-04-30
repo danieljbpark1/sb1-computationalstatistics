@@ -1,0 +1,437 @@
+---
+title: "Computational Stats Final Project"
+author: "Daniel J. Park"
+date: "3/18/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup 
+```{r}
+library(mgcv)
+library(MASS)
+library(stringr)
+library(gamm4)
+library(tidyr)
+library(ggplot2)
+library(ggthemes)
+library(viridis)
+library(cowplot)
+library(kableExtra)
+library(docxtools)
+library(knitr)
+library(tibble)
+library(dplyr)
+library(gratia)
+library(latex2exp)
+library(GGally)
+library(car)
+library(tidyverse)
+library(glmnet)
+
+#Set the default theme for ggplot objects to theme_bw()
+theme_set(theme_bw())
+theme_update(panel.grid = element_blank())
+```
+
+# Code to reproduce CO2 analysis
+
+```{r}
+#The default CO2 plant variable is ordered;
+#This recodes it to an unordered factor
+CO2 <- transform(CO2, Plant_uo=factor(Plant, ordered=FALSE))
+
+CO2_vis_plot <- ggplot(CO2, aes(x=conc, 
+                                y=uptake, 
+                                group=Plant,
+                                color=Plant, 
+                                lty=Plant)) +
+  geom_point() +
+  geom_line() +
+  labs(x=expression(CO[2] ~ concentration ~ (mL ~ L^{-1})), 
+       y=expression(CO[2] ~ uptake ~ (mu*mol ~ m^{-2})))
+
+CO2_vis_plot
+```
+
+## Model 1: Single global smoother
+```{r}
+CO2_modG <- gam(log(uptake) ~ s(log(conc), k=5, bs="tp") +
+                  s(Plant_uo, k=12, bs="re"),
+                data=CO2, method="REML", family="gaussian")
+  
+#plot the default gratia plot for the CO2 model
+draw(CO2_modG)
+```
+
+```{r}
+# setup prediction data
+CO2_modG_pred <- with(CO2,
+                      expand.grid(conc=seq(min(conc), max(conc), length=100),
+                                  Plant_uo=levels(Plant_uo)))
+
+# make the prediction, add this and a column of standard errors to the prediction
+# data.frame. Predictions are on the log scale.
+CO2_modG_pred <- cbind(CO2_modG_pred,
+                       predict(CO2_modG, 
+                               CO2_modG_pred, 
+                               se.fit=TRUE, 
+                               type="response"))
+
+# make the plot. Note here the use of the exp() function to back-transform the
+# predictions (which are for log-uptake) to the original scale
+ggplot(data=CO2, aes(x=conc, y=uptake, color=Plant_uo, group=Plant_uo)) +
+  facet_wrap(~Plant_uo) +
+  geom_ribbon(aes(ymin=exp(fit - 2*se.fit), ymax=exp(fit + 2*se.fit), x=conc),
+              data=CO2_modG_pred, 
+              alpha=0.3, 
+              inherit.aes=FALSE) +
+  geom_line(aes(y=exp(fit)), data=CO2_modG_pred) +
+  geom_point() +
+  labs(title="Model 1 Predictions",
+       x=expression(CO[2] ~ concentration ~ (mL ~ L^{-1})),
+       y=expression(CO[2] ~ uptake ~ (mu*mol ~ m^{-2})))
+```
+
+## Model 2: Global smoother plus group-level smoothers with similar wiggliness
+```{r}
+CO2_modGS <- gam(log(uptake) ~ s(log(conc), k=5, m=2) + 
+                   s(log(conc), Plant_uo, k=5,  bs="fs", m=2),
+                 data=CO2, method="REML")
+
+
+#gratia draw() plot for CO2_modGS
+draw(CO2_modGS)
+```
+
+```{r}
+# setup prediction data
+CO2_modGS_pred <- predict(CO2_modGS, se.fit=TRUE)
+CO2 <- transform(CO2, 
+                 modGS = CO2_modGS_pred$fit, 
+                 modGS_se = CO2_modGS_pred$se.fit)
+
+# plot the predictions
+ggplot(data=CO2, aes(x=conc, y=uptake, color=Plant_uo, group=Plant_uo)) +
+  facet_wrap(~Plant_uo) +
+  geom_ribbon(aes(ymin=exp(modGS-2*modGS_se),
+                  ymax=exp(modGS+2*modGS_se)), alpha=0.25, color=NA) +
+  geom_line(aes(y=exp(modGS))) +
+  geom_point() +
+  labs(x=expression(CO[2] ~ concentration ~ (mL ~ L^{-1})),
+       y=expression(CO[2] ~ uptake ~ (mu*mol ~ m^{-2})))
+```
+
+## Model 3: Global smoother plus group-level smoothers with different wiggliness
+```{r}
+CO2_modGI <- gam(log(uptake) ~ s(log(conc), k=5, m=2, bs="tp") +
+                   s(log(conc), by= Plant_uo, k=5, m=1, bs="tp") +
+                   s(Plant_uo, bs="re", k=12),
+                 data=CO2, method="REML")
+
+#plotting CO2_modGI 
+draw(CO2_modGI, select = c(1,2,14,8,11,5), scales = "fixed")
+```
+
+```{r}
+# setup prediction data
+CO2_modGI_pred <- predict(CO2_modGI, se.fit=TRUE)
+CO2 <- transform(CO2, 
+                 modGI = CO2_modGI_pred$fit, 
+                 modGI_se = CO2_modGI_pred$se.fit)
+
+# plot the predictions
+ggplot(data=CO2, aes(x=conc, y=uptake, color=Plant_uo, group=Plant_uo)) +
+  facet_wrap(~Plant_uo) +
+  geom_ribbon(aes(ymin=exp(modGI-2*modGI_se),
+                  ymax=exp(modGI+2*modGI_se)), alpha=0.25, color=NA) +
+  geom_line(aes(y=exp(modGI))) +
+  geom_point() +
+  labs(x=expression(CO[2] ~ concentration ~ (mL ~ L^{-1})),
+       y=expression(CO[2] ~ uptake ~ (mu*mol ~ m^{-2})))
+```
+
+## AIC evaluation
+```{r}
+AIC_table <- AIC(CO2_modG,CO2_modGS, CO2_modGI) %>%
+  rownames_to_column(var= "Model") %>%
+  mutate(data_source = rep("CO2", 3)) %>%
+  group_by(data_source) %>%
+  mutate(deltaAIC = AIC - min(AIC)) %>%
+  ungroup()%>%
+  dplyr::select(-data_source) %>%
+  mutate_at(.vars = vars(df,AIC, deltaAIC), 
+            .funs = funs(round,.args = list(digits=0)))
+
+AIC_table
+```
+
+# MPG dataset analysis
+```{r}
+# read in data
+mpg.dat <- read.table("http://archive.ics.uci.edu/ml/machine-learning-databases/auto-mpg/auto-mpg.data", 
+                      header = FALSE)
+colnames(mpg.dat) <- c("mpg", "cylinders", "displacement", "hp", "weight", "acceleration", 
+                       "year", "origin", "car_name")
+# data types
+# str(mpg.dat)
+# no missing values
+# apply(mpg.dat, 2, function(x) any(is.na(x)))
+
+# modify data types
+mpg.dat$hp <- as.numeric(mpg.dat$hp)
+mpg.dat$origin <- as.factor(mpg.dat$origin)
+
+# remove car name from dataset
+mpg.dat <- subset(mpg.dat, select = -c(car_name))
+
+# shift year so that minimum starts at 0 not 1970
+# re-lable origin from integer to character
+mpg.dat <- mpg.dat %>%  
+  mutate(
+    year = year - min(year),
+    origin = case_when(
+      origin == 1 ~ "American",
+      origin == 2 ~ "European",
+      origin == 3 ~ "Japanese",
+      TRUE ~ "other"
+    )
+  )
+
+# convert origin into a factor variable
+mpg.dat$origin <- factor(mpg.dat$origin, ordered = FALSE)
+
+str(mpg.dat)
+summary(mpg.dat)
+```
+
+## Selection of plots
+We plot four of the covariates against `mpg`, color-coded by region of origin. Looking at `mpg` versus `year`, there seems to be a shared shape, even if the regions differ in the range of their responses. The acceleration plot, however, seems to suggest that the group-level smoothers need to be allowed differing wiggliness.
+
+```{r}
+mpg_dat_plot_yr <- ggplot(mpg.dat, 
+                       aes(x=year, 
+                           y=mpg, 
+                           group=origin,
+                           color=origin, 
+                           lty=origin)) + 
+  geom_point() +
+  labs(title="MPG Data",
+       x="Model Year since 1970", 
+       y="mpg")
+
+mpg_dat_plot_disp <- ggplot(mpg.dat,
+                            aes(x=displacement,
+                                y=mpg,
+                                group=origin,
+                                color=origin,
+                                lty=origin)) +
+  geom_point() +
+  labs(title="MPG Data",
+       x="Engine displacement in cubic inches", 
+       y="mpg")
+
+mpg_dat_plot_acc <- ggplot(mpg.dat,
+                            aes(x=acceleration,
+                                y=mpg,
+                                group=origin,
+                                color=origin,
+                                lty=origin)) +
+  geom_point() +
+  labs(title="MPG Data",
+       x="Time to accelerate from 0 to 60mph", 
+       y="mpg")
+
+mpg_dat_plot_hp <- ggplot(mpg.dat,
+                            aes(x=hp,
+                                y=mpg,
+                                group=origin,
+                                color=origin,
+                                lty=origin)) +
+  geom_point() +
+  labs(title="MPG Data",
+       x="Horsepower", 
+       y="mpg")
+
+plot_grid(mpg_dat_plot_yr,
+          mpg_dat_plot_disp,
+          mpg_dat_plot_acc,
+          mpg_dat_plot_hp)
+```
+
+Displacement, cylinders, and weight are strongly correlated with each other, so I don't need to include all three in a model. I proceed with only displacement and the other covariates.
+
+```{r warning=FALSE, message=FALSE}
+GGally::ggpairs(subset(mpg.dat, select = c(mpg, cylinders, displacement, hp, weight, acceleration)))
+```
+
+## Training and Testing Data
+I use even years for the training set, odd years for the test set.
+```{r}
+mpg.dat_train <- subset(mpg.dat, year %% 2 == 0)
+mpg.dat_test <- subset(mpg.dat, year %% 2 == 1)
+```
+
+```{r}
+#This function calculates the deviance of out-of-sample data,
+#conditional on their mean predicted value from the model
+get_deviance <- function(model, y_pred, y_obs, weights = NULL){
+  stopifnot(length(y_obs)==length(y_pred))
+  #We don't use the weights term in this paper, but it can be useful if
+  #how well the model matters more for some sample points than others
+  if(is.null(weights)) weights = rep(1, times= length(y_obs))
+  #this uses the deviance residual function from the model family to
+  #calculate deviances for individual points
+  dev_residuals = model$family$dev.resids(y_obs, y_pred, weights)
+  return(sum(dev_residuals))
+}
+```
+
+## MPG Models 1, 2, and 3
+```{r}
+mpg_mod1 <- gam(mpg ~ s(displacement, bs="tp") +
+                  s(hp, k=7, bs="tp") +
+                  s(acceleration, bs="tp") +
+                  s(year, k=5, bs="tp") +
+                  s(origin, k=3, bs="re"),
+                data = mpg.dat_train,
+                family = "gaussian",
+                method = "REML",
+                drop.unused.levels = FALSE)
+
+mpg_mod2 <- gam(mpg ~ s(displacement, bs="tp") +
+                  s(displacement, origin, bs="fs", m=2) +
+                  s(hp, bs="tp") +
+                  s(hp, origin, bs="fs", m=2) +
+                  s(acceleration, bs="tp") +
+                  s(acceleration, origin, bs="fs", m=2) +
+                  s(year, k=5, bs="tp") +
+                  s(year, origin, k=3, bs="fs", m=2),
+                data = mpg.dat_train,
+                family = "gaussian",
+                method = "REML",
+                drop.unused.levels = FALSE)
+
+mpg_mod3 <- gam(mpg ~ s(displacement, bs="tp", m=2) +
+                  s(displacement, by=origin, k=7, bs="tp", m=1) +
+                  s(hp, bs="tp", m=2) +
+                  s(hp, by=origin, k=7, bs="tp", m=1) +
+                  s(acceleration, bs="tp", m=2) +
+                  s(acceleration, by=origin, k=7, bs="tp", m=1) +
+                  s(year, k=5, bs="tp", m=2) +
+                  s(year, by=origin, k=3, bs="tp", m=1) +
+                  s(origin, k=3, bs="re"),
+                data = mpg.dat_train,
+                family = "gaussian",
+                method = "REML",
+                drop.unused.levels = FALSE)
+```
+
+## MPG Models 4 and 5
+```{r}
+mpg_mod4 <- gam(mpg ~ s(displacement, origin, bs="fs", m=2) +
+                  s(hp, origin, bs="fs", m=2) +
+                  s(acceleration, origin, bs="fs", m=2) +
+                  s(year, origin, k=3, bs="fs", m=2),
+                data = mpg.dat_train,
+                family = "gaussian",
+                method = "REML",
+                drop.unused.levels = FALSE)
+
+mpg_mod5 <- gam(mpg ~ s(displacement, by=origin, k=7, bs="tp", m=1) +
+                  s(hp, by=origin, k=7, bs="tp", m=1) +
+                  s(acceleration, by=origin, k=7, bs="tp", m=1) +
+                  s(year, by=origin, k=3, bs="tp", m=1) +
+                  s(origin, k=3, bs="re"),
+                data = mpg.dat_train,
+                family = "gaussian",
+                method = "REML",
+                drop.unused.levels = FALSE)
+```
+
+### Checking residuals and qqplots for model fit
+We show QQ-plots with simulated confidence intervals. The deviance residuals from all the models look approximately normally distributed as we wanted. 
+```{r}
+par(mfrow=c(2,2))
+gam.check(mpg_mod1)
+gam.check(mpg_mod2)
+gam.check(mpg_mod3)
+gam.check(mpg_mod4)
+gam.check(mpg_mod5)
+
+plt1 <- qq_plot(mpg_mod5, method = "simulate") +
+  labs(title =NULL, subtitle =NULL)
+df <- data.frame(log_fitted = log(fitted(mpg_mod5)),
+                 residuals  = resid(mpg_mod5, type = "deviance"))
+plt2 <- ggplot(df, aes(x = log_fitted, y = residuals)) +
+    geom_point() +
+    labs(x = "Linear predictor", y = "Deviance residual")
+plot_grid(plt1, plt2, ncol = 2, align = "hv", axis = "lrtb",labels=c("A","B"))
+```
+
+### Comparing out-of-sample predictions
+Fit a null model with only an intercept for comparison:
+```{r}
+mpg_mod0 <- gam(mpg ~ s(origin, bs="re"),
+                data = mpg.dat_train,
+                family = "gaussian",
+                method = "REML",
+                drop.unused.levels = FALSE)
+```
+
+Get the out-of-sample predictions for all models:
+```{r}
+# We look at the correlation between fitted and observed values for all regions of origin:
+mpg_test_summary <- mpg.dat_test %>%
+  mutate(
+    # out-of-sample predicted fits
+    mod0 = predict(mpg_mod0, ., type="response"),
+    mod1 = predict(mpg_mod1, ., type="response"),
+    mod2 = predict(mpg_mod2, ., type="response"),
+    mod3 = predict(mpg_mod3, ., type="response"),
+    mod4 = predict(mpg_mod4, ., type="response"),
+    mod5 = predict(mpg_mod5, ., type="response")
+  ) %>%
+  group_by(origin) %>%
+  summarise(
+    `Intercept only` = format(get_deviance(mpg_mod0, mod0, mpg),
+                              scientific=FALSE,
+                              digits=2),
+    `Model 1` = format(get_deviance(mpg_mod1, mod1, mpg),
+                       scientific=FALSE,
+                       digits=2),
+    `Model 2` = format(get_deviance(mpg_mod2, mod2, mpg),
+                       scientific=FALSE,
+                       digits=2),
+    `Model 3` = format(get_deviance(mpg_mod3, mod3, mpg),
+                       scientific=FALSE,
+                       digits=2),
+    `Model 4` = format(get_deviance(mpg_mod4, mod4, mpg),
+                       scientific=FALSE,
+                       digits=2),
+    `Model 5` = format(get_deviance(mpg_mod5, mod5, mpg),
+                       scientific=FALSE,
+                       digits=2)
+  )
+
+mpg_test_summary
+```
+
+### AIC evaluation
+```{r}
+mpg_AIC_table <- AIC(mpg_mod1, mpg_mod2, mpg_mod3, mpg_mod4, mpg_mod5) %>%
+  rownames_to_column(var= "Model") %>%
+  mutate(data_source = rep("mpg.dat", 5)) %>%
+  group_by(data_source) %>%
+  mutate(deltaAIC = AIC - min(AIC)) %>%
+  ungroup() %>%
+  dplyr::select(-data_source) %>%
+  mutate_at(.vars = vars(df, AIC, deltaAIC), 
+            .funs = funs(round,.args = list(digits=0)))
+
+mpg_AIC_table
+```
+
